@@ -5,41 +5,38 @@ use Platformsh\Cli\Command\CommandBase;
 use Platformsh\Cli\Exception\RootNotFoundException;
 use Platformsh\Cli\Helper\ShellHelper;
 use Platformsh\Cli\Util\RelationshipsUtil;
-use Symfony\Component\Console\Input\InputOption;
+use Platformsh\Cli\Util\Table;
 use Symfony\Component\Console\Input\InputInterface;
-use Symfony\Component\Console\Output\BufferedOutput;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Yaml\Yaml;
-use Symfony\Component\Console\Style\SymfonyStyle;
 
-class EnvironmentSqlSizeCommand extends CommandBase {
+class EnvironmentSqlSizeCommand extends CommandBase
+{
 
-    protected function configure() {
+    protected function configure()
+    {
         $this
             ->setName('environment:sql-size')
             ->setAliases(['sqls'])
-            ->setDescription('Database size check')
-            ->addOption('yaml', NULL, InputOption::VALUE_NONE, 'Format the response as YAML.');
+            ->setDescription('Estimate the disk usage of a database');
         $this->addProjectOption()->addEnvironmentOption()->addAppOption();
+        Table::addFormatOption($this->getDefinition());
     }
 
-    protected function execute(InputInterface $input, OutputInterface $output) {
-        // Boilerplate.
+    protected function execute(InputInterface $input, OutputInterface $output)
+    {
         $this->validateInput($input);
 
         $sshUrl = $this->getSelectedEnvironment()
             ->getSshUrl($this->selectApp($input));
 
-
         /** @var ShellHelper $shellHelper */
         $shellHelper = $this->getHelper('shell');
-        $bufferedOutput = new BufferedOutput();
-        $shellHelper->setOutput($bufferedOutput);
 
         // Get and parse app config.
         $args = ['ssh', $sshUrl, 'echo $' . self::$config->get('service.env_prefix') . 'APPLICATION'];
-        $result = $shellHelper->execute($args, NULL, TRUE);
-        $appConfig = json_decode(base64_decode($result), TRUE);
+        $result = $shellHelper->execute($args, null, true);
+        $appConfig = json_decode(base64_decode($result), true);
         $databaseService = $appConfig['relationships']['database'];
         list($dbServiceName, $dbServiceType) = explode(":", $databaseService);
 
@@ -64,11 +61,9 @@ class EnvironmentSqlSizeCommand extends CommandBase {
         }
         if ($output->getVerbosity() >= OutputInterface::VERBOSITY_DEBUG) {
             $command[] = '-vv';
-        }
-        elseif ($output->getVerbosity() >= OutputInterface::VERBOSITY_VERY_VERBOSE) {
+        } elseif ($output->getVerbosity() >= OutputInterface::VERBOSITY_VERY_VERBOSE) {
             $command[] = '-v';
-        }
-        elseif ($output->getVerbosity() <= OutputInterface::VERBOSITY_VERBOSE) {
+        } elseif ($output->getVerbosity() <= OutputInterface::VERBOSITY_VERBOSE) {
             $command[] = '-q';
         }
         $command[] = $sshUrl;
@@ -87,53 +82,88 @@ class EnvironmentSqlSizeCommand extends CommandBase {
 
         $percentsUsed = $estimatedUsage * 100 / $allocatedDisk;
 
-        // @todo: yaml output
-        if ($input->getOption('yaml')) {
-            $output->writeln(
-                Yaml::dump(
-                    [
-                        'max' => (int) $allocatedDisk,
-                        'used' => (int) $estimatedUsage,
-                        'percent_used' => (int) $percentsUsed . "%"
-                    ]
-                )
-            );
-            return;
-        }
-        $io = new SymfonyStyle($input, $output);
-        $io->title('Estimated database server usage');
-        $io->listing(
-            [
-                'Allocated disk size: '. (int) $allocatedDisk . ' MB',
-                'Estimated usage: '. (int) $estimatedUsage . ' MB',
-                'Percentage of used space: '. (int) $percentsUsed . "%",
-            ]
+        $table = new Table($input, $output);
+        $propertyNames = [
+            'max',
+            'used',
+            'percent_used',
+        ];
+        $machineReadable = $table->formatIsMachineReadable();
+        $values = [
+            (int) $allocatedDisk . ($machineReadable ? '' : 'MB'),
+            (int) $estimatedUsage . ($machineReadable ? '' : 'MB'),
+            (int) $percentsUsed . '%',
+        ];
+
+        $this->stdErr->writeln('Estimated disk usage for the database: <comment>' . $dbServiceName . '</comment>');
+
+        $table->renderSimple($values, $propertyNames);
+
+        return 0;
+    }
+
+    /**
+     * Returns a command to query disk usage for a PostgreSQL database.
+     *
+     * @param array $database The database connection details.
+     *
+     * @return string
+     */
+    private function psqlQuery(array $database)
+    {
+        // I couldn't find a way to run the SUM directly in the database query...
+        $query = 'SELECT'
+          . ' sum(pg_relation_size(pg_class.oid))::bigint AS size'
+          . ' FROM pg_class'
+          . ' LEFT OUTER JOIN pg_namespace ON (pg_namespace.oid = pg_class.relnamespace)'
+          . ' GROUP BY pg_class.relkind, nspname'
+          . ' ORDER BY sum(pg_relation_size(pg_class.oid)) DESC;';
+
+        $dbUrl = sprintf(
+            'postgresql://%s:%s@%s/%s',
+            $database['username'],
+            $database['password'],
+            $database['host'],
+            $database['path']
+        );
+
+        return sprintf(
+            "psql --echo-hidden -t --no-align %s -c '%s' 2>&1",
+            $dbUrl,
+            $query
         );
     }
 
+    /**
+     * Returns a command to query disk usage for a MySQL database.
+     *
+     * @param array $database The database connection details.
+     *
+     * @return string
+     */
+    private function mysqlQuery(array $database)
+    {
+        $query = 'SELECT'
+            . ' ('
+            . 'SUM(data_length+index_length+data_free)'
+            . ' + (COUNT(*) * 300 * 1024)'
+            . ')'
+            . '/' . (1048576 + 150) . ' AS estimated_actual_disk_usage'
+            . ' FROM information_schema.tables';
 
-    private function psqlQuery($database) {
-        // I couldn't find a way to run the SUM directly in the database query...
-        $query = "
-          SELECT
-            sum(pg_relation_size(pg_class.oid))::bigint AS size
-          FROM pg_class
-          LEFT OUTER JOIN pg_namespace ON (pg_namespace.oid = pg_class.relnamespace)
-          GROUP BY pg_class.relkind, nspname
-          ORDER BY sum(pg_relation_size(pg_class.oid)) DESC;
-        ";
+        $connectionParams = sprintf(
+            '--user=%s --password=%s --host=%s --database=%s --port=%d',
+            $database['username'],
+            $database['password'],
+            $database['host'],
+            $database['path'],
+            $database['port']
+        );
 
-        return "psql --echo-hidden -t --no-align postgresql://{$database['username']}:{$database['password']}@{$database['host']}/{$database['path']} -c \"$query\" 2>&1";
-    }
-
-    private function mysqlQuery($database) {
-        $query = "
-        SELECT 
-          (SUM(data_length+index_length+data_free) + (COUNT(*) * 300 * 1024))/1048576+150 AS estimated_actual_disk_usage
-        FROM information_schema.tables
-        ";
-        $params = '--no-auto-rehash --raw --skip-column-names';
-
-        return "mysql $params --database={$database['path']} --host={$database['host']} --port={$database['port']} --user={$database['username']} --password={$database['password']} --execute \"$query\" 2>&1";
+        return sprintf(
+            "mysql %s --no-auto-rehash --raw --skip-column-names --execute '%s' 2>&1",
+            $connectionParams,
+            $query
+        );
     }
 }
